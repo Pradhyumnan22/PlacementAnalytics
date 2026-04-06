@@ -1,6 +1,7 @@
 import { useEffect, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
 import { motion } from "framer-motion";
+import { apiUrl, toUserErrorMessage } from "../utils/api";
 import {
   AreaChart,
   Area,
@@ -27,17 +28,36 @@ const departmentMap = {
   CIVIL: "Civil Engineering",
 };
 
+const STATUS_STAGES = ["Not Ready", "Training", "Eligible", "Applied", "Interview", "Placed"];
+
+const normalizeStatus = (status) => {
+  const match = STATUS_STAGES.find((stage) => stage.toLowerCase() === String(status || "").toLowerCase().trim());
+  return match || "Not Ready";
+};
+
+const formatStudyYear = (value) => {
+  const year = Number(value);
+  if (!Number.isFinite(year) || year < 1 || year > 4) return "N/A";
+  return `${year}${year === 1 ? "st" : year === 2 ? "nd" : year === 3 ? "rd" : "th"} Year`;
+};
+
 const defaultStudent = {
   name: "Sneha Kumar",
   regNo: "PA2400213",
   department: "Computer Science",
+  studyYear: 1,
   cgpa: 8.56,
   attendance: 91,
   activityPoints: 80,
   arrears: 0,
+  status: "Not Ready",
   semesterPerformance: [],
   skillScores: [],
   recentActivities: [],
+  placementProgress: [],
+  mockTests: [],
+  interviews: [],
+  resumeVersions: [],
 };
 
 const toFinite = (value, fallback = 0) => {
@@ -108,6 +128,29 @@ const normalizeActivities = (activities) => {
   return FALLBACK_ACTIVITIES;
 };
 
+const normalizePlacementProgress = (items) => {
+  if (!Array.isArray(items) || !items.length) return [];
+
+  return items
+    .map((item) => {
+      const company = String(item?.company || item?.name || "").trim();
+      const roundsClearedRaw = Array.isArray(item?.roundsCleared)
+        ? item.roundsCleared
+        : Array.isArray(item?.selectedRounds)
+          ? item.selectedRounds
+          : [];
+      const roundsCleared = roundsClearedRaw
+        .map((round) => String(round || "").trim())
+        .filter(Boolean);
+      const outcome = String(item?.outcome || "").trim() || (item?.eliminationRound === "Selected" ? "Selected" : "Eliminated");
+      const eliminationRound = String(item?.eliminationRound || (outcome === "Selected" ? "Selected" : "N/A")).trim();
+      const eliminationReason = String(item?.eliminationReason || "").trim();
+
+      return { company, roundsCleared, eliminationRound, eliminationReason, outcome };
+    })
+    .filter((item) => item.company);
+};
+
 const normalizeStudent = (raw) => {
   const safe = raw && typeof raw === "object" ? raw : {};
   const departmentCode = String(safe.department || "").toUpperCase();
@@ -115,20 +158,30 @@ const normalizeStudent = (raw) => {
     ...defaultStudent,
     ...safe,
     department: departmentMap[departmentCode] || safe.department || defaultStudent.department,
+    status: normalizeStatus(safe.status),
   };
 
   normalized.semesterPerformance = normalizeSemesterData(safe.semesterPerformance, safe.cgpa);
   normalized.skillScores = normalizeSkillData(safe.skillScores, normalized);
   normalized.recentActivities = normalizeActivities(safe.recentActivities);
+  normalized.placementProgress = normalizePlacementProgress(safe.placementProgress);
+  normalized.studyYear = Number.isFinite(Number(safe.studyYear))
+    ? Math.min(4, Math.max(1, Number(safe.studyYear)))
+    : defaultStudent.studyYear;
 
   return normalized;
 };
 
 const fetchJson = async (url, token, options = {}) => {
-  const response = await fetch(url, {
-    ...options,
-    headers: { authorization: token, ...(options.headers || {}) },
-  });
+  let response;
+  try {
+    response = await fetch(apiUrl(url), {
+      ...options,
+      headers: { authorization: token, ...(options.headers || {}) },
+    });
+  } catch (error) {
+    throw new Error(toUserErrorMessage(error, "Unable to reach server. Check backend is running."));
+  }
   const bodyText = await response.text();
   let body;
   try {
@@ -172,6 +225,19 @@ export default function StudentDashboard() {
   const [viewerRole, setViewerRole] = useState("");
   const [isEditing, setIsEditing] = useState(false);
   const [saveMessage, setSaveMessage] = useState("");
+  const [insights, setInsights] = useState({
+    checklist: [],
+    readinessScore: 0,
+    actionPlan: [],
+    profileCompleteness: { score: 0, completed: 0, total: 0 },
+    notifications: [],
+    upcomingDrives: [],
+  });
+  const [drives, setDrives] = useState([]);
+  const [simulations, setSimulations] = useState([]);
+  const [announcements, setAnnouncements] = useState([]);
+  const [mockDraft, setMockDraft] = useState({ type: "Aptitude", score: "", weakTopics: "" });
+  const [resumeDraft, setResumeDraft] = useState({ label: "", url: "" });
   const [editDraft, setEditDraft] = useState({
     name: "",
     department: "",
@@ -179,6 +245,7 @@ export default function StudentDashboard() {
     attendance: "",
     activityPoints: "",
     arrears: "",
+    status: "Not Ready",
   });
 
   useEffect(() => {
@@ -193,20 +260,35 @@ export default function StudentDashboard() {
         }
 
         let response;
+        let insightsResponse = null;
+        let drivesResponse = [];
         if (role === "student") {
-          response = await fetchJson("http://localhost:5000/api/student/me", token);
+          const [profileData, insightData, driveData, simulationData, announcementData] = await Promise.all([
+            fetchJson("/api/student/me", token),
+            fetchJson("/api/student/insights", token).catch(() => null),
+            fetchJson("/api/drives", token).catch(() => []),
+            fetchJson("/api/student/eligibility-simulator", token).catch(() => ({ simulations: [] })),
+            fetchJson("/api/announcements", token).catch(() => []),
+          ]);
+          response = profileData;
+          insightsResponse = insightData;
+          drivesResponse = Array.isArray(driveData) ? driveData : [];
+          setSimulations(Array.isArray(simulationData?.simulations) ? simulationData.simulations : []);
+          setAnnouncements(Array.isArray(announcementData) ? announcementData : []);
           setIsAdminPreview(false);
         } else if ((role === "admin" || role === "placement_officer") && regNo) {
           try {
-            response = await fetchJson(`http://localhost:5000/api/students/${encodeURIComponent(regNo)}`, token);
+            response = await fetchJson(`/api/students/${encodeURIComponent(regNo)}`, token);
           } catch {
-            const allStudents = await fetchJson("http://localhost:5000/api/students", token);
+            const allStudents = await fetchJson("/api/students", token);
             const match = Array.isArray(allStudents)
               ? allStudents.find((item) => String(item?.regNo || "").toUpperCase() === String(regNo).toUpperCase())
               : null;
             if (!match) throw new Error("Student not found");
             response = match;
           }
+          drivesResponse = await fetchJson("/api/drives", token).catch(() => []);
+          setAnnouncements(await fetchJson("/api/announcements", token).catch(() => []));
           setIsAdminPreview(true);
         } else {
           navigate("/");
@@ -214,9 +296,20 @@ export default function StudentDashboard() {
         }
 
         setStudent(normalizeStudent(response));
+        if (insightsResponse && typeof insightsResponse === "object") {
+          setInsights({
+            checklist: Array.isArray(insightsResponse.checklist) ? insightsResponse.checklist : [],
+            readinessScore: Number(insightsResponse.readinessScore) || 0,
+            actionPlan: Array.isArray(insightsResponse.actionPlan) ? insightsResponse.actionPlan : [],
+            profileCompleteness: insightsResponse.profileCompleteness || { score: 0, completed: 0, total: 0 },
+            notifications: Array.isArray(insightsResponse.notifications) ? insightsResponse.notifications : [],
+            upcomingDrives: Array.isArray(insightsResponse.upcomingDrives) ? insightsResponse.upcomingDrives : [],
+          });
+        }
+        setDrives(Array.isArray(drivesResponse) ? drivesResponse : []);
         setLoadError("");
       } catch (error) {
-        setLoadError(error.message || "Failed to load student profile");
+        setLoadError(toUserErrorMessage(error, "Failed to load student profile. Check backend server."));
       }
     };
 
@@ -231,6 +324,7 @@ export default function StudentDashboard() {
       attendance: String(student.attendance ?? ""),
       activityPoints: String(student.activityPoints ?? ""),
       arrears: String(student.arrears ?? ""),
+      status: normalizeStatus(student.status),
     });
   }, [student]);
 
@@ -249,10 +343,11 @@ export default function StudentDashboard() {
         attendance: Number(editDraft.attendance),
         activityPoints: Number(editDraft.activityPoints),
         arrears: Number(editDraft.arrears),
+        status: normalizeStatus(editDraft.status),
       };
 
       const data = await fetchJson(
-        `http://localhost:5000/api/students/${encodeURIComponent(regNo)}`,
+        `/api/students/${encodeURIComponent(regNo)}`,
         token,
         {
           method: "PATCH",
@@ -265,7 +360,7 @@ export default function StudentDashboard() {
       setIsEditing(false);
       setSaveMessage("Updated successfully");
     } catch (error) {
-      setSaveMessage(error.message || "Update failed");
+      setSaveMessage(toUserErrorMessage(error, "Update failed. Check backend server."));
     }
   };
 
@@ -274,6 +369,99 @@ export default function StudentDashboard() {
     localStorage.removeItem("role");
     localStorage.removeItem("loginId");
     navigate("/");
+  };
+
+  const downloadCalendarIcs = async () => {
+    try {
+      const token = localStorage.getItem("token");
+      if (!token) return;
+      const endpoint = viewerRole === "student" ? "/api/student/calendar.ics" : "/api/admin/calendar.ics";
+      const response = await fetch(apiUrl(endpoint), { headers: { authorization: token } });
+      if (!response.ok) throw new Error("Unable to download calendar");
+      const icsText = await response.text();
+      const blob = new Blob([icsText], { type: "text/calendar;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const anchor = document.createElement("a");
+      anchor.href = url;
+      anchor.download = viewerRole === "student" ? "student-calendar.ics" : "dashboard-calendar.ics";
+      anchor.click();
+      URL.revokeObjectURL(url);
+      setSaveMessage("Calendar downloaded.");
+    } catch (error) {
+      setSaveMessage(toUserErrorMessage(error, "Failed to download calendar."));
+    }
+  };
+
+  const applyToDrive = async (driveId, action = "apply") => {
+    try {
+      const token = localStorage.getItem("token");
+      if (!token) return;
+      const endpoint = action === "withdraw" ? `/api/drives/${driveId}/withdraw` : `/api/drives/${driveId}/apply`;
+      await fetchJson(endpoint, token, { method: "POST" });
+      const updatedDrives = await fetchJson("/api/drives", token);
+      setDrives(Array.isArray(updatedDrives) ? updatedDrives : []);
+      setSaveMessage(action === "withdraw" ? "Application withdrawn." : "Applied successfully.");
+    } catch (error) {
+      setSaveMessage(toUserErrorMessage(error, "Unable to update application."));
+    }
+  };
+
+  const submitMockTest = async () => {
+    try {
+      const token = localStorage.getItem("token");
+      if (!token) return;
+      const payload = {
+        type: mockDraft.type,
+        score: Number(mockDraft.score),
+        weakTopics: mockDraft.weakTopics
+          .split(",")
+          .map((item) => item.trim())
+          .filter(Boolean),
+      };
+      const response = await fetchJson("/api/student/mock-tests", token, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      setStudent((prev) => ({ ...prev, mockTests: response.mockTests || prev.mockTests || [] }));
+      setMockDraft({ type: "Aptitude", score: "", weakTopics: "" });
+      setSaveMessage("Mock test saved.");
+    } catch (error) {
+      setSaveMessage(toUserErrorMessage(error, "Unable to save mock test."));
+    }
+  };
+
+  const uploadResumeVersion = async () => {
+    try {
+      const token = localStorage.getItem("token");
+      if (!token) return;
+      const response = await fetchJson("/api/student/resume", token, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(resumeDraft),
+      });
+      setStudent((prev) => ({ ...prev, resumeVersions: response.resumeVersions || prev.resumeVersions || [] }));
+      setResumeDraft({ label: "", url: "" });
+      setSaveMessage("Resume version uploaded.");
+    } catch (error) {
+      setSaveMessage(toUserErrorMessage(error, "Unable to upload resume."));
+    }
+  };
+
+  const respondInterview = async (interviewId, status) => {
+    try {
+      const token = localStorage.getItem("token");
+      if (!token) return;
+      const response = await fetchJson(`/api/student/interviews/${interviewId}/respond`, token, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ status }),
+      });
+      setStudent((prev) => ({ ...prev, interviews: response.interviews || prev.interviews || [] }));
+      setSaveMessage(`Interview ${status.toLowerCase()}.`);
+    } catch (error) {
+      setSaveMessage(toUserErrorMessage(error, "Unable to update interview response."));
+    }
   };
 
   const cards = [
@@ -287,6 +475,54 @@ export default function StudentDashboard() {
   const semesterData = student.semesterPerformance || [];
   const skillData = student.skillScores || [];
   const activityFeed = student.recentActivities || [];
+  const placementProgress = student.placementProgress || [];
+  const companiesAttended = placementProgress.length;
+  const totalRoundsCleared = placementProgress.reduce((sum, item) => sum + (item.roundsCleared?.length || 0), 0);
+  const roundWiseSelections = placementProgress.reduce((acc, item) => {
+    (item.roundsCleared || []).forEach((round) => {
+      acc[round] = (acc[round] || 0) + 1;
+    });
+    return acc;
+  }, {});
+  const fallbackChecklist = [
+    { id: "cgpa", label: "Minimum CGPA 7.0", met: (student.cgpa || 0) >= 7, current: Number(student.cgpa || 0).toFixed(2) },
+    { id: "attendance", label: "Attendance at least 75%", met: (student.attendance || 0) >= 75, current: `${Math.round(student.attendance || 0)}%` },
+    { id: "arrears", label: "No active arrears", met: Number(student.arrears || 0) === 0, current: String(student.arrears || 0) },
+    { id: "activity", label: "Activity points at least 60", met: (student.activityPoints || 0) >= 60, current: String(student.activityPoints || 0) },
+  ];
+  const eligibilityChecklist = insights.checklist?.length ? insights.checklist : fallbackChecklist;
+  const actionPlanItems = insights.actionPlan?.length
+    ? insights.actionPlan
+    : ["Maintain your current progress and keep practicing aptitude and interviews."];
+  const profileCompleteness = Number(insights.profileCompleteness?.score || 0);
+  const readinessScore = Number(insights.readinessScore || Math.round(((student.cgpa || 0) / 10) * 100));
+  const notifications = insights.notifications?.length
+    ? insights.notifications
+    : [{ type: "info", message: "No new notifications right now.", deadline: null }];
+  const driveMap = Array.isArray(drives)
+    ? drives.reduce((acc, drive) => {
+      acc[String(drive._id || drive.id)] = drive;
+      return acc;
+    }, {})
+    : {};
+  const sourceDrives = insights.upcomingDrives?.length
+    ? insights.upcomingDrives
+    : Array.isArray(drives)
+      ? drives.slice(0, 6)
+      : [];
+  const upcomingDrives = sourceDrives.map((drive) => {
+    const id = String(drive.id || drive._id || `${drive.company}-${drive.title}`);
+    const mapped = driveMap[id] || {};
+    return {
+      id,
+      company: drive.company || mapped.company || "Company",
+      title: drive.title || mapped.title || "Drive",
+      deadline: drive.deadline || mapped.deadline,
+      eligible: typeof drive.eligible === "boolean" ? drive.eligible : (typeof mapped.eligible === "boolean" ? mapped.eligible : null),
+      reasons: Array.isArray(drive.reasons) ? drive.reasons : (Array.isArray(mapped.reasons) ? mapped.reasons : []),
+      applicationStatus: drive.applicationStatus || mapped.applicationStatus || "not_applied",
+    };
+  });
 
   return (
     <motion.div style={styles.page} initial={{ opacity: 0 }} animate={{ opacity: 1 }} transition={{ duration: 0.4 }}>
@@ -295,7 +531,7 @@ export default function StudentDashboard() {
       <div style={styles.bgGrid} />
 
       <aside style={styles.sidebar}>
-        <h2 style={styles.logo}>PA</h2>
+        <img src="/rmk-logo.png" alt="RMK Engineering College logo" style={styles.logo} />
         <button type="button" style={styles.menuToggle} onClick={() => setShowSideActions((prev) => !prev)}>
           {showSideActions ? "Close" : "Menu"}
         </button>
@@ -306,6 +542,15 @@ export default function StudentDashboard() {
             ...(showSideActions ? styles.navOpen : styles.navClosed),
           }}
         >
+          <motion.button
+            type="button"
+            onClick={downloadCalendarIcs}
+            style={styles.menuButton}
+            whileHover={{ x: 4 }}
+            whileTap={{ scale: 0.98 }}
+          >
+            Calendar
+          </motion.button>
           <motion.button
             type="button"
             onClick={handleLogout}
@@ -321,7 +566,7 @@ export default function StudentDashboard() {
       <main style={styles.main}>
         {isAdminPreview && (
           <div style={styles.previewBanner}>
-            {viewerRole === "placement_officer" ? "Placement officer" : "Admin"} preview mode for {student.name}
+            {viewerRole === "placement_officer" ? "Admin" : "Faculty"} preview mode for {student.name}
           </div>
         )}
         <motion.section style={styles.hero} initial={{ opacity: 0, y: 18 }} animate={{ opacity: 1, y: 0 }}>
@@ -332,6 +577,8 @@ export default function StudentDashboard() {
           </div>
           <div style={styles.heroBadgeWrap}>
             <span style={styles.heroBadge}>{isReady ? "Placement Ready" : "Needs Improvement"}</span>
+            <span style={styles.heroSubBadge}>Status: {normalizeStatus(student.status)}</span>
+            <span style={styles.heroSubBadge}>{formatStudyYear(student.studyYear)}</span>
             <span style={styles.heroSubBadge}>{student.department || "Department"}</span>
           </div>
         </motion.section>
@@ -357,6 +604,99 @@ export default function StudentDashboard() {
               <p style={styles.cardNote}>{card.note}</p>
             </motion.div>
           ))}
+        </section>
+
+        <section style={styles.insightGrid}>
+          <motion.article style={styles.panel} initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }}>
+            <div style={styles.panelHeader}>
+              <h3 style={styles.panelTitle}>Eligibility Checklist</h3>
+              <span style={styles.panelPill}>Readiness {readinessScore}%</span>
+            </div>
+            <div style={styles.checklistWrap}>
+              {eligibilityChecklist.map((item) => (
+                <div key={item.id || item.label} style={styles.checklistRow}>
+                  <span style={item.met ? styles.checkOk : styles.checkWarn}>{item.met ? "PASS" : "PENDING"}</span>
+                  <span style={styles.checkLabel}>{item.label}</span>
+                  <span style={styles.checkCurrent}>{item.current}</span>
+                </div>
+              ))}
+            </div>
+            <div style={styles.progressMeta}>
+              <span style={styles.progressLabel}>Profile completeness</span>
+              <span style={styles.progressValue}>{profileCompleteness}%</span>
+            </div>
+            <div style={styles.skillTrack}>
+              <div style={{ ...styles.skillFill, width: `${Math.max(0, Math.min(100, profileCompleteness))}%` }} />
+            </div>
+          </motion.article>
+
+          <motion.article style={styles.panel} initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }}>
+            <div style={styles.panelHeader}>
+              <h3 style={styles.panelTitle}>Action Plan</h3>
+              <span style={styles.panelPill}>Next Steps</span>
+            </div>
+            <div style={styles.feedWrap}>
+              {actionPlanItems.map((item, index) => (
+                <p key={`${item}-${index}`} style={styles.feedItem}>• {item}</p>
+              ))}
+            </div>
+            <div style={styles.feedWrap}>
+              <p style={styles.feedTitle}>Notifications</p>
+              {notifications.map((item, index) => (
+                <p key={`${item.message}-${index}`} style={styles.feedItem}>
+                  {item.message}
+                  {item.deadline ? ` (Deadline: ${new Date(item.deadline).toLocaleDateString()})` : ""}
+                </p>
+              ))}
+            </div>
+          </motion.article>
+        </section>
+
+        <section style={styles.insightGrid}>
+          <motion.article style={styles.panel} initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }}>
+            <div style={styles.panelHeader}>
+              <h3 style={styles.panelTitle}>Eligibility Simulator</h3>
+              <span style={styles.panelPill}>Company Fit</span>
+            </div>
+            <div style={styles.timelineList}>
+              {simulations.slice(0, 8).map((item) => (
+                <div key={item.driveId} style={styles.timelineRow}>
+                  <div>
+                    <p style={styles.timelineCompany}>{item.company}</p>
+                    <p style={styles.timelineRole}>{item.title}</p>
+                  </div>
+                  <div style={styles.timelineMeta}>
+                    <span style={item.eligible ? styles.checkOk : styles.checkWarn}>{item.eligible ? "Eligible" : "Not Eligible"}</span>
+                    {!item.eligible && (
+                      <span style={styles.timelineRole}>{(item.reasons || []).slice(0, 2).join(", ")}</span>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {!simulations.length && <p style={styles.emptyNote}>No simulation data available.</p>}
+            </div>
+          </motion.article>
+
+          <motion.article style={styles.panel} initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }}>
+            <div style={styles.panelHeader}>
+              <h3 style={styles.panelTitle}>Announcements</h3>
+              <span style={styles.panelPill}>Broadcasts</span>
+            </div>
+            <div style={styles.timelineList}>
+              {announcements.slice(0, 6).map((announcement) => (
+                <div key={announcement._id} style={styles.timelineRow}>
+                  <div>
+                    <p style={styles.timelineCompany}>{announcement.title}</p>
+                    <p style={styles.timelineRole}>{announcement.message}</p>
+                  </div>
+                  <div style={styles.timelineMeta}>
+                    <span style={styles.timelineDate}>{new Date(announcement.createdAt).toLocaleDateString()}</span>
+                  </div>
+                </div>
+              ))}
+              {!announcements.length && <p style={styles.emptyNote}>No announcements right now.</p>}
+            </div>
+          </motion.article>
         </section>
 
         <section style={styles.contentGrid}>
@@ -396,7 +736,7 @@ export default function StudentDashboard() {
               <div style={styles.avatar}>{(student.name || "S").slice(0, 2).toUpperCase()}</div>
               <div>
                 <p style={styles.profileName}>{student.name}</p>
-                <p style={styles.profileMeta}>{student.regNo} | {student.department}</p>
+                <p style={styles.profileMeta}>{student.regNo} | {student.department} | {formatStudyYear(student.studyYear)}</p>
               </div>
             </div>
 
@@ -500,6 +840,21 @@ export default function StudentDashboard() {
                       onChange={(event) => setEditDraft((prev) => ({ ...prev, arrears: event.target.value }))}
                     />
                   </label>
+                  <label style={styles.editLabel}>
+                    Status
+                    <select
+                      style={styles.editInput}
+                      value={editDraft.status}
+                      disabled={!isEditing}
+                      onChange={(event) => setEditDraft((prev) => ({ ...prev, status: event.target.value }))}
+                    >
+                      {STATUS_STAGES.map((stage) => (
+                        <option key={stage} value={stage}>
+                          {stage}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
                 </div>
               </div>
             )}
@@ -530,6 +885,227 @@ export default function StudentDashboard() {
               </div>
             ))}
             {!skillData.length && <p style={styles.emptyNote}>No skill data available.</p>}
+          </div>
+        </motion.section>
+
+        <motion.section style={styles.panel} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}>
+          <div style={styles.panelHeader}>
+            <h3 style={styles.panelTitle}>Upcoming Drives Timeline</h3>
+            <span style={styles.panelPill}>Deadlines</span>
+          </div>
+          <div style={styles.timelineList}>
+            {upcomingDrives.map((drive) => (
+              <div key={drive.id} style={styles.timelineRow}>
+                <div>
+                  <p style={styles.timelineCompany}>{drive.company}</p>
+                  <p style={styles.timelineRole}>{drive.title}</p>
+                </div>
+                <div style={styles.timelineMeta}>
+                  <span style={styles.timelineDate}>{drive.deadline ? new Date(drive.deadline).toLocaleDateString() : "TBA"}</span>
+                  {typeof drive.eligible === "boolean" && (
+                    <span style={drive.eligible ? styles.checkOk : styles.checkWarn}>
+                      {drive.eligible ? "Eligible" : "Improve"}
+                    </span>
+                  )}
+                  {viewerRole === "student" && (
+                    <button
+                      type="button"
+                      style={styles.timelineAction}
+                      onClick={() => applyToDrive(drive.id, drive.applicationStatus === "applied" ? "withdraw" : "apply")}
+                      disabled={drive.eligible === false && drive.applicationStatus !== "applied"}
+                    >
+                      {drive.applicationStatus === "applied" ? "Withdraw" : "Apply"}
+                    </button>
+                  )}
+                </div>
+              </div>
+            ))}
+            {!upcomingDrives.length && <p style={styles.emptyNote}>No active drives right now.</p>}
+          </div>
+        </motion.section>
+
+        <section style={styles.insightGrid}>
+          <motion.article style={styles.panel} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}>
+            <div style={styles.panelHeader}>
+              <h3 style={styles.panelTitle}>Mock Test Tracker</h3>
+              <span style={styles.panelPill}>Practice Scores</span>
+            </div>
+            {viewerRole === "student" && (
+              <div style={styles.mockForm}>
+                <select
+                  style={styles.editInput}
+                  value={mockDraft.type}
+                  onChange={(event) => setMockDraft((prev) => ({ ...prev, type: event.target.value }))}
+                >
+                  <option value="Aptitude">Aptitude</option>
+                  <option value="Coding">Coding</option>
+                  <option value="Verbal">Verbal</option>
+                </select>
+                <input
+                  style={styles.editInput}
+                  placeholder="Score (0-100)"
+                  value={mockDraft.score}
+                  onChange={(event) => setMockDraft((prev) => ({ ...prev, score: event.target.value }))}
+                />
+                <input
+                  style={styles.editInput}
+                  placeholder="Weak topics (comma separated)"
+                  value={mockDraft.weakTopics}
+                  onChange={(event) => setMockDraft((prev) => ({ ...prev, weakTopics: event.target.value }))}
+                />
+                <button type="button" style={styles.editButton} onClick={submitMockTest}>
+                  Add Mock Test
+                </button>
+              </div>
+            )}
+            <div style={styles.timelineList}>
+              {(student.mockTests || []).slice(-6).reverse().map((test, index) => (
+                <div key={`${test.type}-${index}`} style={styles.timelineRow}>
+                  <div>
+                    <p style={styles.timelineCompany}>{test.type}</p>
+                    <p style={styles.timelineRole}>
+                      Weak areas: {Array.isArray(test.weakTopics) && test.weakTopics.length ? test.weakTopics.join(", ") : "None"}
+                    </p>
+                  </div>
+                  <div style={styles.timelineMeta}>
+                    <span style={styles.timelineDate}>{new Date(test.takenAt || Date.now()).toLocaleDateString()}</span>
+                    <span style={styles.panelPill}>{Math.round(Number(test.score || 0))}%</span>
+                  </div>
+                </div>
+              ))}
+              {!student.mockTests?.length && <p style={styles.emptyNote}>No mock tests added yet.</p>}
+            </div>
+          </motion.article>
+
+          <motion.article style={styles.panel} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}>
+            <div style={styles.panelHeader}>
+              <h3 style={styles.panelTitle}>Interview Scheduler</h3>
+              <span style={styles.panelPill}>Upcoming Slots</span>
+            </div>
+            <div style={styles.timelineList}>
+              {(student.interviews || []).slice(-8).reverse().map((interview, index) => (
+                <div key={`${interview.company}-${interview.slotTime}-${index}`} style={styles.timelineRow}>
+                  <div>
+                    <p style={styles.timelineCompany}>{interview.company}</p>
+                    <p style={styles.timelineRole}>{interview.round} | {interview.mode || "Online"}</p>
+                  </div>
+                  <div style={styles.timelineMeta}>
+                    <span style={styles.timelineDate}>{new Date(interview.slotTime).toLocaleString()}</span>
+                    <span style={styles.panelPill}>{interview.status}</span>
+                    {viewerRole === "student" && interview.status === "Scheduled" && interview._id && (
+                      <div style={styles.editActions}>
+                        <button type="button" style={styles.editButton} onClick={() => respondInterview(interview._id, "Accepted")}>
+                          Accept
+                        </button>
+                        <button type="button" style={styles.cancelButton} onClick={() => respondInterview(interview._id, "Declined")}>
+                          Decline
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              ))}
+              {!student.interviews?.length && <p style={styles.emptyNote}>No interview slots scheduled.</p>}
+            </div>
+          </motion.article>
+        </section>
+
+        <motion.section style={styles.panel} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}>
+          <div style={styles.panelHeader}>
+            <h3 style={styles.panelTitle}>Resume Tracker</h3>
+            <span style={styles.panelPill}>Version History</span>
+          </div>
+          {viewerRole === "student" && (
+            <div style={styles.mockForm}>
+              <input
+                style={styles.editInput}
+                placeholder="Version label (e.g. Resume v2)"
+                value={resumeDraft.label}
+                onChange={(event) => setResumeDraft((prev) => ({ ...prev, label: event.target.value }))}
+              />
+              <input
+                style={styles.editInput}
+                placeholder="Resume URL"
+                value={resumeDraft.url}
+                onChange={(event) => setResumeDraft((prev) => ({ ...prev, url: event.target.value }))}
+              />
+              <button type="button" style={styles.editButton} onClick={uploadResumeVersion}>
+                Upload Version
+              </button>
+            </div>
+          )}
+          <div style={styles.timelineList}>
+            {(student.resumeVersions || []).slice(-8).reverse().map((entry, index) => (
+              <div key={`${entry.label}-${index}`} style={styles.timelineRow}>
+                <div>
+                  <p style={styles.timelineCompany}>{entry.label}</p>
+                  <p style={styles.timelineRole}>{entry.feedbackComment || "Awaiting faculty review"}</p>
+                </div>
+                <div style={styles.timelineMeta}>
+                  <a href={entry.url} target="_blank" rel="noreferrer" style={styles.resumeLink}>Open</a>
+                  <span style={styles.panelPill}>{entry.feedbackStatus || "Pending"}</span>
+                </div>
+              </div>
+            ))}
+            {!student.resumeVersions?.length && <p style={styles.emptyNote}>No resume versions uploaded yet.</p>}
+          </div>
+        </motion.section>
+
+        <motion.section style={styles.panel} initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }}>
+          <div style={styles.panelHeader}>
+            <h3 style={styles.panelTitle}>Company Rounds</h3>
+            <span style={styles.panelPill}>Interview Journey</span>
+          </div>
+
+          <div style={styles.roundStats}>
+            <div style={styles.roundStatCard}>
+              <p style={styles.roundStatLabel}>Companies Attended</p>
+              <p style={styles.roundStatValue}>{companiesAttended}</p>
+            </div>
+            <div style={styles.roundStatCard}>
+              <p style={styles.roundStatLabel}>Rounds Cleared</p>
+              <p style={styles.roundStatValue}>{totalRoundsCleared}</p>
+            </div>
+          </div>
+
+          <div style={styles.roundSummary}>
+            {Object.keys(roundWiseSelections).length ? (
+              Object.entries(roundWiseSelections).map(([round, count]) => (
+                <span key={round} style={styles.roundChip}>
+                  {round}: {count}
+                </span>
+              ))
+            ) : (
+              <p style={styles.emptyNote}>No round-wise selections yet.</p>
+            )}
+          </div>
+
+          <div style={styles.tableWrap}>
+            <table className="dashboard-table">
+              <thead>
+                <tr>
+                  <th>Company</th>
+                  <th>Rounds Selected</th>
+                  <th>Exit Round</th>
+                  <th>Elimination Reason</th>
+                </tr>
+              </thead>
+              <tbody>
+                {placementProgress.map((item) => (
+                  <tr key={`${item.company}-${item.eliminationRound}`}>
+                    <td>{item.company}</td>
+                    <td>{item.roundsCleared.length ? item.roundsCleared.join(", ") : "None"}</td>
+                    <td>{item.eliminationRound || (item.outcome === "Selected" ? "Selected" : "N/A")}</td>
+                    <td>{item.outcome === "Selected" ? "Selected" : (item.eliminationReason || "Not specified")}</td>
+                  </tr>
+                ))}
+                {!placementProgress.length && (
+                  <tr>
+                    <td colSpan="4">No company attempt data available yet.</td>
+                  </tr>
+                )}
+              </tbody>
+            </table>
           </div>
         </motion.section>
       </main>
@@ -588,14 +1164,13 @@ const styles = {
   },
   logo: {
     marginBottom: "12px",
-    fontSize: "22px",
     width: "64px",
-    height: "44px",
-    display: "grid",
-    placeItems: "center",
+    height: "76px",
     borderRadius: "10px",
-    background: "linear-gradient(145deg, rgba(14,116,144,0.34), rgba(14,116,144,0.14))",
     border: "1px solid rgba(103,232,249,0.35)",
+    background: "rgba(2,6,23,0.35)",
+    objectFit: "contain",
+    padding: "2px",
   },
   menuToggle: {
     width: "64px",
@@ -766,6 +1341,12 @@ const styles = {
     gap: "14px",
     marginBottom: "14px",
   },
+  insightGrid: {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr",
+    gap: "14px",
+    marginBottom: "14px",
+  },
   panel: {
     borderRadius: "18px",
     padding: "18px 20px",
@@ -793,6 +1374,63 @@ const styles = {
     background: "rgba(8,145,178,0.18)",
     borderRadius: "999px",
     padding: "5px 10px",
+    fontWeight: 700,
+  },
+  checklistWrap: {
+    display: "grid",
+    gap: "8px",
+    marginBottom: "12px",
+  },
+  checklistRow: {
+    display: "grid",
+    gridTemplateColumns: "88px 1fr auto",
+    gap: "10px",
+    alignItems: "center",
+  },
+  checkOk: {
+    fontSize: "11px",
+    fontWeight: 700,
+    color: "#bbf7d0",
+    border: "1px solid rgba(34,197,94,0.4)",
+    background: "rgba(34,197,94,0.18)",
+    borderRadius: "999px",
+    padding: "3px 8px",
+    textAlign: "center",
+  },
+  checkWarn: {
+    fontSize: "11px",
+    fontWeight: 700,
+    color: "#fbcfe8",
+    border: "1px solid rgba(244,63,94,0.45)",
+    background: "rgba(244,63,94,0.18)",
+    borderRadius: "999px",
+    padding: "3px 8px",
+    textAlign: "center",
+  },
+  checkLabel: {
+    fontSize: "13px",
+    color: "#d5e2f2",
+  },
+  checkCurrent: {
+    fontSize: "13px",
+    color: "#67e8f9",
+    fontWeight: 700,
+  },
+  progressMeta: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginBottom: "6px",
+  },
+  progressLabel: {
+    fontSize: "12px",
+    color: "#9db2cf",
+    textTransform: "uppercase",
+    letterSpacing: "0.06em",
+  },
+  progressValue: {
+    fontSize: "14px",
+    color: "#67e8f9",
     fontWeight: 700,
   },
   tooltip: {
@@ -986,6 +1624,105 @@ const styles = {
     height: "100%",
     borderRadius: "999px",
     background: "linear-gradient(90deg, #38bdf8, #22c55e)",
+  },
+  roundStats: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))",
+    gap: "10px",
+    marginBottom: "10px",
+  },
+  roundStatCard: {
+    border: "1px solid rgba(148,163,184,0.25)",
+    borderRadius: "12px",
+    background: "rgba(15,23,42,0.6)",
+    padding: "10px 12px",
+  },
+  roundStatLabel: {
+    margin: 0,
+    fontSize: "12px",
+    color: "#9db2cf",
+    textTransform: "uppercase",
+    letterSpacing: "0.05em",
+  },
+  roundStatValue: {
+    margin: "6px 0 0 0",
+    fontSize: "24px",
+    color: "#f8fafc",
+    fontWeight: 700,
+  },
+  roundSummary: {
+    display: "flex",
+    flexWrap: "wrap",
+    gap: "8px",
+    marginBottom: "12px",
+  },
+  timelineList: {
+    display: "grid",
+    gap: "10px",
+  },
+  timelineRow: {
+    display: "flex",
+    justifyContent: "space-between",
+    gap: "10px",
+    alignItems: "center",
+    border: "1px solid rgba(125,211,252,0.2)",
+    background: "rgba(2,6,23,0.45)",
+    borderRadius: "10px",
+    padding: "9px 10px",
+  },
+  timelineCompany: {
+    margin: 0,
+    color: "#f8fafc",
+    fontWeight: 700,
+    fontSize: "14px",
+  },
+  timelineRole: {
+    margin: "2px 0 0",
+    color: "#9db2cf",
+    fontSize: "12px",
+  },
+  timelineMeta: {
+    display: "grid",
+    gap: "4px",
+    justifyItems: "end",
+  },
+  timelineDate: {
+    fontSize: "12px",
+    color: "#cbd5e1",
+  },
+  timelineAction: {
+    padding: "6px 10px",
+    borderRadius: "8px",
+    border: "1px solid rgba(103,232,249,0.35)",
+    background: "rgba(14,165,233,0.2)",
+    color: "#fff",
+    fontSize: "12px",
+    fontWeight: 700,
+    cursor: "pointer",
+  },
+  mockForm: {
+    display: "grid",
+    gridTemplateColumns: "1fr 1fr 1.4fr auto",
+    gap: "8px",
+    marginBottom: "10px",
+  },
+  resumeLink: {
+    color: "#67e8f9",
+    fontSize: "12px",
+    textDecoration: "underline",
+    fontWeight: 700,
+  },
+  roundChip: {
+    borderRadius: "999px",
+    border: "1px solid rgba(56,189,248,0.35)",
+    background: "rgba(56,189,248,0.14)",
+    color: "#d8f5ff",
+    fontSize: "12px",
+    fontWeight: 700,
+    padding: "4px 10px",
+  },
+  tableWrap: {
+    overflowX: "auto",
   },
   emptyNote: {
     margin: "4px 0 0 0",

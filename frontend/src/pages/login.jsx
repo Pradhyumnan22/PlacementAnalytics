@@ -1,5 +1,6 @@
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
+import { apiUrl, toUserErrorMessage } from "../utils/api";
 
 export default function Login() {
   const navigate = useNavigate();
@@ -8,9 +9,39 @@ export default function Login() {
   const [password, setPassword] = useState("");
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState("");
+  const [totalStudents, setTotalStudents] = useState("...");
+  const [readinessRate, setReadinessRate] = useState("...");
+
+  useEffect(() => {
+    let cancelled = false;
+
+    const loadLoginStats = async () => {
+      try {
+        const response = await fetch(apiUrl("/api/login-stats"));
+        if (!response.ok) return;
+
+        const data = await response.json();
+        if (!cancelled) {
+          setTotalStudents(String(data?.totalStudents ?? "..."));
+          setReadinessRate(`${Number(data?.readinessRate ?? 0)}%`);
+        }
+      } catch {
+        if (!cancelled) {
+          setTotalStudents("...");
+          setReadinessRate("...");
+        }
+      }
+    };
+
+    loadLoginStats();
+
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const tryLogin = async (role) => {
-    const response = await fetch("http://localhost:5000/api/login", {
+    const response = await fetch(apiUrl("/api/login"), {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ id, password, role }),
@@ -29,7 +60,7 @@ export default function Login() {
         localStorage.setItem("token", adminAttempt.data.token);
         localStorage.setItem("role", "admin");
         localStorage.setItem("loginId", id);
-        navigate("/admin");
+        navigate("/faculty");
         return;
       }
 
@@ -38,7 +69,7 @@ export default function Login() {
         localStorage.setItem("token", officerAttempt.data.token);
         localStorage.setItem("role", "placement_officer");
         localStorage.setItem("loginId", id);
-        navigate("/placement-officer");
+        navigate("/admin");
         return;
       }
 
@@ -58,7 +89,7 @@ export default function Login() {
         "Login failed"
       );
     } catch (err) {
-      setError(err.message || "Login failed");
+      setError(toUserErrorMessage(err, "Login failed. Unable to reach server."));
     } finally {
       setIsLoading(false);
     }
@@ -72,6 +103,7 @@ export default function Login() {
 
       <div style={{ ...styles.shell, ...(isMobile ? styles.shellMobile : {}) }}>
         <div style={{ ...styles.hero, ...(isMobile ? styles.heroMobile : {}) }}>
+          <img src="/rmk-logo.png" alt="RMK Engineering College logo" style={styles.heroLogo} />
           <p style={styles.heroKicker}>PLACEMENT COMMAND CENTER</p>
           <h1 style={styles.heroTitle}>Placement Analytics</h1>
           <p style={styles.heroSubtitle}>Evaluate readiness, track progress, and drive outcomes.</p>
@@ -79,11 +111,11 @@ export default function Login() {
           <div style={styles.heroStats}>
             <div style={styles.statTile}>
               <p style={styles.statLabel}>Students</p>
-              <p style={styles.statValue}>20</p>
+              <p style={styles.statValue}>{totalStudents}</p>
             </div>
             <div style={styles.statTile}>
               <p style={styles.statLabel}>Readiness</p>
-              <p style={styles.statValue}>78%</p>
+              <p style={styles.statValue}>{readinessRate}</p>
             </div>
           </div>
         </div>
@@ -91,7 +123,7 @@ export default function Login() {
         <div style={{ ...styles.card, ...(isMobile ? styles.cardMobile : {}) }}>
           <div style={styles.cardHead}>
             <h2 style={styles.title}>Secure Login</h2>
-            <p style={styles.subtitle}>Sign in as student or admin</p>
+            <p style={styles.subtitle}>Sign in as student, faculty, or admin</p>
           </div>
 
           <input
@@ -190,6 +222,16 @@ const styles = {
     fontWeight: 700,
     letterSpacing: "0.08em",
     color: "#67e8f9",
+  },
+  heroLogo: {
+    width: 90,
+    height: 108,
+    objectFit: "contain",
+    marginBottom: 12,
+    borderRadius: 12,
+    border: "1px solid rgba(148,163,184,0.35)",
+    background: "rgba(2,6,23,0.45)",
+    padding: 4,
   },
   heroTitle: {
     margin: "10px 0 10px 0",

@@ -5,13 +5,14 @@ import bcrypt from "bcryptjs";
 import connectDB from "../config/db.js";
 import Student from "../models/Student.js";
 import Admin from "../models/Admin.js";
+import { DEFAULT_STUDENT_PASSWORD } from "./studentSeedConfig.js";
 
 dotenv.config({ path: "./.env" });
 
-const ADMIN_USERNAME = "admin";
-const ADMIN_PASSWORD = "admin123";
-const OFFICER_USERNAME = "officer";
-const OFFICER_PASSWORD = "officer123";
+const ADMIN_USERNAME = "faculty";
+const ADMIN_PASSWORD = "faculty123";
+const OFFICER_USERNAME = "admin";
+const OFFICER_PASSWORD = "admin123";
 
 const setupCredentials = async () => {
   try {
@@ -31,31 +32,29 @@ const setupCredentials = async () => {
       { upsert: true, returnDocument: "after", setDefaultsOnInsert: true }
     );
 
+    const studentPasswordHash = await bcrypt.hash(DEFAULT_STUDENT_PASSWORD, 10);
+    await Student.updateMany({}, { $set: { password: studentPasswordHash } });
+
     const students = await Student.find().sort({ regNo: 1 });
     const credentialRows = [];
 
     for (const student of students) {
-      const suffix = student.regNo.slice(-5);
-      const plainPassword = `stud${suffix}`;
-      student.password = await bcrypt.hash(plainPassword, 10);
-      await student.save();
-
-      credentialRows.push(`${student.name} | ${student.regNo} | ${plainPassword}`);
+      credentialRows.push(`${student.name} | ${student.regNo} | ${DEFAULT_STUDENT_PASSWORD}`);
     }
 
     const content = [
-      "ADMIN CREDENTIAL",
-      `admin id: ${ADMIN_USERNAME}`,
-      `admin password: ${ADMIN_PASSWORD}`,
+      "FACULTY CREDENTIAL",
+      `faculty id: ${ADMIN_USERNAME}`,
+      `faculty password: ${ADMIN_PASSWORD}`,
       "",
-      "PLACEMENT OFFICER CREDENTIAL",
-      `officer id: ${OFFICER_USERNAME}`,
-      `officer password: ${OFFICER_PASSWORD}`,
+      "ADMIN CREDENTIAL",
+      `admin id: ${OFFICER_USERNAME}`,
+      `admin password: ${OFFICER_PASSWORD}`,
       "",
       "STUDENT CREDENTIALS (id = register number)",
       ...credentialRows,
       "",
-      "Note: Students use their regNo as ID and listed password.",
+      `Note: Students use their regNo as ID. All student accounts use the same password: ${DEFAULT_STUDENT_PASSWORD}.`,
     ].join("\n");
 
     const outputPath = path.resolve("student-credentials.txt");

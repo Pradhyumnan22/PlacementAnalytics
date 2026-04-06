@@ -18,6 +18,10 @@ const adminSchema = new mongoose.Schema(
       enum: ["admin", "placement_officer"],
       default: "admin",
     },
+    active: {
+      type: Boolean,
+      default: true,
+    },
   },
   { timestamps: true }
 );

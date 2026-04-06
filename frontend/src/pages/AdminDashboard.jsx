@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { motion } from "framer-motion";
+import { apiUrl, toUserErrorMessage } from "../utils/api";
 import {
   ResponsiveContainer,
   BarChart,
@@ -27,6 +28,18 @@ const DEFAULT_COMPANY_OFFERS = [
   { name: "Wipro", offers: 12 },
   { name: "Zoho", offers: 9 },
 ];
+
+const STATUS_STAGES = ["Not Ready", "Training", "Eligible", "Applied", "Interview", "Placed"];
+const formatStudyYear = (value) => {
+  const year = Number(value);
+  if (!Number.isFinite(year) || year < 1 || year > 4) return "N/A";
+  return `${year}${year === 1 ? "st" : year === 2 ? "nd" : year === 3 ? "rd" : "th"} Year`;
+};
+
+const normalizeStatus = (status) => {
+  const match = STATUS_STAGES.find((stage) => stage.toLowerCase() === String(status || "").toLowerCase().trim());
+  return match || "Not Ready";
+};
 
 const normalizePlacementTrend = (trend) => {
   if (!Array.isArray(trend)) return [];
@@ -86,11 +99,15 @@ export default function AdminDashboard() {
   const navigate = useNavigate();
   const [showSideMenu, setShowSideMenu] = useState(false);
   const [search, setSearch] = useState("");
+  const [statusFilter, setStatusFilter] = useState("All");
+  const [departmentFilter, setDepartmentFilter] = useState("All");
+  const [yearFilter, setYearFilter] = useState("All");
   const [studentsData, setStudentsData] = useState([]);
   const [placementTrend, setPlacementTrend] = useState([]);
   const [companyStats, setCompanyStats] = useState([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
+  const [actionStatus, setActionStatus] = useState("");
   const [activeMenu, setActiveMenu] = useState("Dashboard");
   const topRef = useRef(null);
   const analyticsRef = useRef(null);
@@ -108,7 +125,7 @@ export default function AdminDashboard() {
 
         setLoading(true);
         setError("");
-        const studentsResponse = await fetch("http://localhost:5000/api/students", {
+        const studentsResponse = await fetch(apiUrl("/api/students"), {
           headers: { authorization: token },
         });
         if (!studentsResponse.ok) {
@@ -117,7 +134,7 @@ export default function AdminDashboard() {
         const students = await studentsResponse.json();
         setStudentsData(students);
 
-        const analyticsResponse = await fetch("http://localhost:5000/api/admin/analytics", {
+        const analyticsResponse = await fetch(apiUrl("/api/admin/analytics"), {
           headers: { authorization: token },
         });
         if (analyticsResponse.ok) {
@@ -129,7 +146,7 @@ export default function AdminDashboard() {
           setCompanyStats([]);
         }
       } catch (err) {
-        setError(err.message || "Something went wrong");
+        setError(toUserErrorMessage(err, "Unable to fetch dashboard data. Check backend server."));
       } finally {
         setLoading(false);
       }
@@ -138,10 +155,40 @@ export default function AdminDashboard() {
     fetchStudents();
   }, [navigate]);
 
-  const filteredStudents = studentsData.filter((s) =>
-    s.name.toLowerCase().includes(search.toLowerCase()) ||
-    s.regNo.toLowerCase().includes(search.toLowerCase())
-  );
+  const departmentOptions = useMemo(() => {
+    const departments = new Set(
+      studentsData
+        .map((student) => String(student.department || "").trim())
+        .filter(Boolean)
+    );
+    return ["All", ...Array.from(departments).sort()];
+  }, [studentsData]);
+
+  const yearOptions = useMemo(() => {
+    const years = new Set(
+      studentsData
+        .map((student) => Number(student.studyYear))
+        .filter((year) => Number.isFinite(year) && year >= 1 && year <= 4)
+    );
+    return ["All", ...Array.from(years).sort((a, b) => a - b).map((year) => String(year))];
+  }, [studentsData]);
+
+  const filteredStudents = useMemo(() => {
+    const normalizedSearch = search.toLowerCase().trim();
+    return studentsData.filter((student) => {
+      const matchesSearch =
+        !normalizedSearch ||
+        String(student.name || "").toLowerCase().includes(normalizedSearch) ||
+        String(student.regNo || "").toLowerCase().includes(normalizedSearch) ||
+        normalizeStatus(student.status).toLowerCase().includes(normalizedSearch);
+
+      const matchesStatus = statusFilter === "All" || normalizeStatus(student.status) === statusFilter;
+      const matchesDepartment = departmentFilter === "All" || String(student.department || "").trim() === departmentFilter;
+      const matchesYear = yearFilter === "All" || String(student.studyYear || "") === yearFilter;
+
+      return matchesSearch && matchesStatus && matchesDepartment && matchesYear;
+    });
+  }, [studentsData, search, statusFilter, departmentFilter, yearFilter]);
 
   const formatCgpa = (value) => {
     const parsed = Number(value);
@@ -182,6 +229,15 @@ export default function AdminDashboard() {
     return { totalStudents, avgCgpa, avgAttendance, readyRate };
   }, [studentsData]);
 
+  const statusCounts = useMemo(() => {
+    const counts = STATUS_STAGES.reduce((acc, stage) => ({ ...acc, [stage]: 0 }), {});
+    studentsData.forEach((student) => {
+      const stage = normalizeStatus(student.status);
+      counts[stage] += 1;
+    });
+    return counts;
+  }, [studentsData]);
+
   const trendData = useMemo(() => {
     const normalized = normalizePlacementTrend(placementTrend);
     return normalized.length ? normalized : DEFAULT_PLACEMENT_TREND;
@@ -207,6 +263,89 @@ export default function AdminDashboard() {
     { label: "Average Attendance", value: dashboardStats.avgAttendance, tone: "green", note: "Overall presence" },
     { label: "Placement Ready", value: dashboardStats.readyRate, tone: "teal", note: "Eligible profile rate" },
   ];
+
+  const atRiskStudents = useMemo(() => {
+    return studentsData
+      .map((student) => {
+        const reasons = [];
+        if (Number(student.cgpa || 0) < 7) reasons.push("Low CGPA");
+        if (Number(student.attendance || 0) < 75) reasons.push("Low Attendance");
+        if (Number(student.arrears || 0) > 0) reasons.push("Has Arrears");
+        return { ...student, reasons };
+      })
+      .filter((student) => student.reasons.length)
+      .slice(0, 8);
+  }, [studentsData]);
+
+  const cohortComparison = useMemo(() => {
+    const departmentMap = {};
+    studentsData.forEach((student) => {
+      const department = String(student.department || "Unknown").trim() || "Unknown";
+      if (!departmentMap[department]) {
+        departmentMap[department] = { department, total: 0, ready: 0, cgpaSum: 0 };
+      }
+      departmentMap[department].total += 1;
+      departmentMap[department].cgpaSum += Number(student.cgpa || 0);
+      if (Number(student.cgpa || 0) >= 7 && Number(student.attendance || 0) >= 75 && Number(student.arrears || 0) === 0) {
+        departmentMap[department].ready += 1;
+      }
+    });
+
+    return Object.values(departmentMap).map((item) => ({
+      department: item.department,
+      readyRate: item.total ? Math.round((item.ready / item.total) * 100) : 0,
+      avgCgpa: item.total ? Number((item.cgpaSum / item.total).toFixed(2)) : 0,
+    }));
+  }, [studentsData]);
+
+  const exportFilteredToCsv = () => {
+    const headers = ["Name", "RegNo", "Department", "Year", "CGPA", "Attendance", "Arrears", "Status", "NotesCount"];
+    const rows = filteredStudents.map((student) => [
+      student.name,
+      student.regNo,
+      student.department,
+      student.studyYear,
+      student.cgpa,
+      student.attendance,
+      student.arrears,
+      normalizeStatus(student.status),
+      Array.isArray(student.mentorNotes) ? student.mentorNotes.length : 0,
+    ]);
+    const csv = [headers, ...rows]
+      .map((row) => row.map((item) => `"${String(item ?? "").replace(/"/g, "\"\"")}"`).join(","))
+      .join("\n");
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `faculty-students-${new Date().toISOString().slice(0, 10)}.csv`;
+    link.click();
+    URL.revokeObjectURL(url);
+  };
+
+  const addStudentNote = async (regNo) => {
+    const note = window.prompt("Enter mentoring note (max 500 chars):");
+    if (!note || !note.trim()) return;
+    try {
+      const token = localStorage.getItem("token");
+      if (!token) return;
+      setActionStatus("Saving mentor note...");
+      const response = await fetch(apiUrl(`/api/students/${encodeURIComponent(regNo)}/notes`), {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          authorization: token,
+        },
+        body: JSON.stringify({ text: note.trim() }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.msg || "Failed to save note");
+      setStudentsData((prev) => prev.map((item) => (item.regNo === regNo ? { ...item, mentorNotes: data.mentorNotes } : item)));
+      setActionStatus(`Mentor note saved for ${regNo}`);
+    } catch (noteError) {
+      setActionStatus(toUserErrorMessage(noteError, "Unable to save note."));
+    }
+  };
 
   const scrollToSection = (sectionRef, sectionName) => {
     setActiveMenu(sectionName);
@@ -253,7 +392,7 @@ export default function AdminDashboard() {
       <div style={styles.bgGrid} />
       {/* Sidebar */}
       <aside style={styles.sidebar}>
-        <h2 style={styles.logo}>PA</h2>
+        <img src="/rmk-logo.png" alt="RMK Engineering College logo" style={styles.logo} />
         <button
           type="button"
           style={styles.menuToggle}
@@ -300,7 +439,7 @@ export default function AdminDashboard() {
           <div style={styles.titleRow}>
             <div>
               <p style={styles.kicker}>PLACEMENT COMMAND CENTER</p>
-              <h1 style={styles.title}>Admin Dashboard</h1>
+              <h1 style={styles.title}>Faculty Dashboard</h1>
               <p style={styles.subtitle}>Placement insights, student readiness, and live records</p>
             </div>
             <div style={styles.livePillWrap}>
@@ -316,6 +455,61 @@ export default function AdminDashboard() {
               onChange={(e) => setSearch(e.target.value)}
               style={styles.search}
             />
+            <div style={styles.filterRow}>
+              <select
+                value={statusFilter}
+                onChange={(event) => setStatusFilter(event.target.value)}
+                style={styles.filterSelect}
+              >
+                <option value="All">All Status</option>
+                {STATUS_STAGES.map((stage) => (
+                  <option key={stage} value={stage}>
+                    {stage}
+                  </option>
+                ))}
+              </select>
+              <select
+                value={departmentFilter}
+                onChange={(event) => setDepartmentFilter(event.target.value)}
+                style={styles.filterSelect}
+              >
+                {departmentOptions.map((department) => (
+                  <option key={department} value={department}>
+                    {department === "All" ? "All Departments" : department}
+                  </option>
+                ))}
+              </select>
+              <select
+                value={yearFilter}
+                onChange={(event) => setYearFilter(event.target.value)}
+                style={styles.filterSelect}
+              >
+                {yearOptions.map((year) => (
+                  <option key={year} value={year}>
+                    {year === "All" ? "All Years" : formatStudyYear(year)}
+                  </option>
+                ))}
+              </select>
+              <button
+                type="button"
+                style={styles.clearButton}
+                onClick={() => {
+                  setSearch("");
+                  setStatusFilter("All");
+                  setDepartmentFilter("All");
+                  setYearFilter("All");
+                }}
+              >
+                Clear
+              </button>
+              <button
+                type="button"
+                style={styles.exportButton}
+                onClick={exportFilteredToCsv}
+              >
+                Export CSV
+              </button>
+            </div>
           </div>
         </motion.section>
 
@@ -340,6 +534,60 @@ export default function AdminDashboard() {
               <p style={styles.kpiNote}>{card.note}</p>
             </motion.div>
           ))}
+        </div>
+        <div style={styles.statusGrid}>
+          {STATUS_STAGES.map((stage) => (
+            <div key={stage} style={styles.statusCard}>
+              <p style={styles.statusCardLabel}>{stage}</p>
+              <p style={styles.statusCardValue}>{statusCounts[stage] || 0}</p>
+            </div>
+          ))}
+        </div>
+        {!!actionStatus && <p style={styles.actionStatus}>{actionStatus}</p>}
+
+        <div style={styles.grid}>
+          <motion.div
+            style={styles.card}
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.3 }}
+          >
+            <div style={styles.trendHeader}>
+              <h3 style={styles.trendTitle}>At-Risk Students</h3>
+              <span style={styles.tableCount}>{atRiskStudents.length} flagged</span>
+            </div>
+            <div style={styles.riskList}>
+              {atRiskStudents.map((student) => (
+                <div key={student.regNo} style={styles.riskItem}>
+                  <div>
+                    <p style={styles.riskName}>{student.name}</p>
+                    <p style={styles.riskMeta}>{student.regNo}</p>
+                  </div>
+                  <span style={styles.riskReason}>{student.reasons.join(", ")}</span>
+                </div>
+              ))}
+              {!atRiskStudents.length && <p style={styles.emptyText}>No at-risk students right now.</p>}
+            </div>
+          </motion.div>
+
+          <motion.div
+            style={styles.card}
+            initial={{ opacity: 0, y: 20 }}
+            animate={{ opacity: 1, y: 0 }}
+            transition={{ duration: 0.3, delay: 0.05 }}
+          >
+            <h3 style={styles.trendTitle}>Cohort Comparison</h3>
+            <ResponsiveContainer width="100%" height={250}>
+              <BarChart data={cohortComparison}>
+                <CartesianGrid strokeDasharray="4 4" stroke="rgba(148,163,184,0.18)" />
+                <XAxis dataKey="department" stroke="#94a3b8" tickLine={false} axisLine={false} />
+                <YAxis stroke="#94a3b8" tickLine={false} axisLine={false} />
+                <Tooltip />
+                <Bar dataKey="readyRate" fill="#22c55e" name="Ready %" radius={[6, 6, 0, 0]} />
+                <Bar dataKey="avgCgpa" fill="#60a5fa" name="Avg CGPA" radius={[6, 6, 0, 0]} />
+              </BarChart>
+            </ResponsiveContainer>
+          </motion.div>
         </div>
 
         {/* Charts Section */}
@@ -439,17 +687,21 @@ export default function AdminDashboard() {
                 <th style={styles.numericHeader}>CGPA</th>
                 <th style={styles.numericHeader}>Attendance</th>
                 <th style={styles.numericHeader}>Activity Points</th>
+                <th>Year</th>
+                <th>Status</th>
+                <th style={styles.numericHeader}>Notes</th>
+                <th>Actions</th>
               </tr>
             </thead>
             <tbody>
               {loading && (
                 <tr>
-                  <td colSpan="5">Loading students...</td>
+                  <td colSpan="9">Loading students...</td>
                 </tr>
               )}
               {!loading && error && (
                 <tr>
-                  <td colSpan="5">{error}</td>
+                  <td colSpan="9">{error}</td>
                 </tr>
               )}
               {!loading &&
@@ -466,6 +718,21 @@ export default function AdminDashboard() {
                     <td style={styles.numericCell}>{formatCgpa(s.cgpa)}</td>
                     <td style={styles.numericCell}>{formatAttendance(s.attendance)}</td>
                     <td style={styles.numericCell}>{s.activityPoints}</td>
+                    <td>{formatStudyYear(s.studyYear)}</td>
+                    <td><span style={styles.statusBadge}>{normalizeStatus(s.status)}</span></td>
+                    <td style={styles.numericCell}>{Array.isArray(s.mentorNotes) ? s.mentorNotes.length : 0}</td>
+                    <td>
+                      <button
+                        type="button"
+                        style={styles.noteButton}
+                        onClick={(event) => {
+                          event.stopPropagation();
+                          addStudentNote(s.regNo);
+                        }}
+                      >
+                        Add Note
+                      </button>
+                    </td>
                   </tr>
                 ))}
             </tbody>
@@ -528,14 +795,13 @@ const styles = {
   },
   logo: {
     marginBottom: "14px",
-    fontSize: "22px",
     width: "64px",
-    height: "44px",
-    display: "grid",
-    placeItems: "center",
+    height: "76px",
     borderRadius: "10px",
-    background: "linear-gradient(145deg, rgba(14,116,144,0.34), rgba(14,116,144,0.14))",
     border: "1px solid rgba(103,232,249,0.35)",
+    background: "rgba(2,6,23,0.35)",
+    objectFit: "contain",
+    padding: "2px",
   },
   nav: {
     position: "absolute",
@@ -660,6 +926,41 @@ const styles = {
   searchWrap: {
     marginBottom: "4px",
   },
+  filterRow: {
+    marginTop: "10px",
+    display: "flex",
+    gap: "10px",
+    flexWrap: "wrap",
+  },
+  filterSelect: {
+    padding: "10px 12px",
+    borderRadius: "10px",
+    border: "1px solid rgba(125,211,252,0.25)",
+    background: "rgba(15,23,42,0.75)",
+    color: "white",
+    minWidth: "160px",
+    fontSize: "13px",
+    outline: "none",
+  },
+  clearButton: {
+    padding: "10px 14px",
+    borderRadius: "10px",
+    border: "1px solid rgba(148,163,184,0.28)",
+    background: "rgba(15,23,42,0.85)",
+    color: "#e2e8f0",
+    fontSize: "13px",
+    fontWeight: 700,
+    marginRight: 0,
+  },
+  exportButton: {
+    padding: "10px 14px",
+    borderRadius: "10px",
+    border: "1px solid rgba(52,211,153,0.35)",
+    background: "rgba(16,185,129,0.15)",
+    color: "#d1fae5",
+    fontSize: "13px",
+    fontWeight: 700,
+  },
   search: {
     padding: "12px 16px",
     borderRadius: "12px",
@@ -676,6 +977,31 @@ const styles = {
     gridTemplateColumns: "repeat(auto-fit,minmax(170px,1fr))",
     gap: "14px",
     marginBottom: "18px",
+  },
+  statusGrid: {
+    display: "grid",
+    gridTemplateColumns: "repeat(auto-fit,minmax(140px,1fr))",
+    gap: "10px",
+    marginBottom: "18px",
+  },
+  statusCard: {
+    borderRadius: "12px",
+    padding: "10px 12px",
+    border: "1px solid rgba(148,163,184,0.22)",
+    background: "linear-gradient(180deg, rgba(15,23,42,0.85), rgba(15,23,42,0.58))",
+  },
+  statusCardLabel: {
+    margin: 0,
+    fontSize: "12px",
+    color: "#9db2cf",
+    textTransform: "uppercase",
+    letterSpacing: "0.06em",
+  },
+  statusCardValue: {
+    margin: "6px 0 0 0",
+    fontSize: "24px",
+    fontWeight: 700,
+    color: "#f8fafc",
   },
   kpiCard: {
     borderRadius: "14px",
@@ -791,9 +1117,10 @@ const styles = {
     fontWeight: 600,
   },
   tableContainer: {
-    maxHeight: "420px",
-    overflowY: "auto",
+    height: "420px",
+    overflow: "auto",
     borderRadius: "12px",
+    border: "1px solid rgba(125,211,252,0.12)",
   },
   rowAlt: {
     background: "rgba(15,32,64,0.3)",
@@ -807,6 +1134,70 @@ const styles = {
   },
   numericHeader: {
     textAlign: "right",
+  },
+  statusBadge: {
+    display: "inline-block",
+    padding: "4px 8px",
+    borderRadius: "999px",
+    fontSize: "12px",
+    fontWeight: 700,
+    color: "#d8f5ff",
+    border: "1px solid rgba(56,189,248,0.35)",
+    background: "rgba(56,189,248,0.14)",
+  },
+  actionStatus: {
+    margin: "0 0 14px 0",
+    color: "#93c5fd",
+    fontSize: "13px",
+  },
+  riskList: {
+    display: "grid",
+    gap: "8px",
+  },
+  riskItem: {
+    display: "flex",
+    justifyContent: "space-between",
+    alignItems: "center",
+    gap: "10px",
+    border: "1px solid rgba(148,163,184,0.25)",
+    background: "rgba(2,6,23,0.45)",
+    borderRadius: "10px",
+    padding: "8px 10px",
+  },
+  riskName: {
+    margin: 0,
+    color: "#f8fafc",
+    fontSize: "14px",
+    fontWeight: 700,
+  },
+  riskMeta: {
+    margin: "2px 0 0 0",
+    color: "#9db2cf",
+    fontSize: "12px",
+  },
+  riskReason: {
+    border: "1px solid rgba(244,63,94,0.4)",
+    background: "rgba(244,63,94,0.15)",
+    color: "#fecdd3",
+    borderRadius: "999px",
+    padding: "4px 8px",
+    fontSize: "11px",
+    fontWeight: 700,
+  },
+  noteButton: {
+    padding: "6px 10px",
+    borderRadius: "8px",
+    border: "1px solid rgba(103,232,249,0.4)",
+    background: "rgba(14,165,233,0.2)",
+    color: "#fff",
+    cursor: "pointer",
+    fontSize: "12px",
+    fontWeight: 700,
+  },
+  emptyText: {
+    margin: "4px 0 0 0",
+    color: "#9db2cf",
+    fontSize: "13px",
   },
   table: {
     width: "100%",
