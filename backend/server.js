@@ -15,6 +15,7 @@ import AuditLog from "./models/AuditLog.js";
 import Announcement from "./models/Announcement.js";
 
 dotenv.config();
+await connectDB();
 
 const app = express();
 const __filename = fileURLToPath(import.meta.url);
@@ -1521,8 +1522,6 @@ const startServer = async () => {
     if (!process.env.JWT_SECRET) {
       throw new Error("JWT_SECRET is not set in environment variables");
     }
-
-    await connectDB();
 
     if (process.env.NODE_ENV === "production") {
       app.use(express.static(frontendDistPath));
